@@ -1,8 +1,7 @@
 import React from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Image } from 'react-native';
-import { DrawerContentScrollView, DrawerItemList } from '@react-navigation/drawer';
+import { View, Text, StyleSheet, TouchableOpacity, ScrollView } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import Icon from 'react-native-vector-icons/MaterialIcons';
+import { DrawerContentScrollView, DrawerItemList } from '@react-navigation/drawer';
 
 export const DrawerContent = (props) => {
   const insets = useSafeAreaInsets();
@@ -59,13 +58,13 @@ export const DrawerContent = (props) => {
       {/* Header Section */}
       <View style={styles.header}>
         <View style={styles.logoContainer}>
-          <Icon name="record-voice-over" size={36} color="#3B82F6" />
+          <Text style={styles.logoEmoji}>🎤</Text>
         </View>
-        <Text style={styles.appTitle}>Voice Recorder</Text>
-        <Text style={styles.appDescription}>Professional Audio Recording</Text>
+        <Text style={styles.appTitle}>Easy Voice</Text>
+        <Text style={styles.appDescription}>Professional Voice Assistant</Text>
         
         <TouchableOpacity style={styles.closeButton} onPress={handleCloseDrawer}>
-          <Icon name="close" size={20} color="#6B7280" />
+          <Text style={styles.closeIcon}>✕</Text>
         </TouchableOpacity>
       </View>
 
@@ -85,14 +84,14 @@ export const DrawerContent = (props) => {
               <Text style={styles.menuItemTitle}>{item.title.split(' ').slice(1).join(' ')}</Text>
               <Text style={styles.menuItemDescription}>{item.description}</Text>
             </View>
-            <Icon name="chevron-right" size={20} color="#9CA3AF" />
+            <Text style={styles.chevronIcon}>›</Text>
           </TouchableOpacity>
         ))}
       </ScrollView>
 
       {/* Footer */}
       <View style={[styles.footer, { paddingBottom: insets.bottom }]}>
-        <Text style={styles.footerText}>Voice Recorder App v1.0</Text>
+        <Text style={styles.footerText}>Easy Voice v1.0</Text>
       </View>
     </View>
   );
@@ -112,12 +111,12 @@ const styles = StyleSheet.create({
   },
   closeButton: {
     position: 'absolute',
-    top: 24,
-    right: 24,
+    top: 16,
+    right: 16,
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: '#F3F4F6',
     justifyContent: 'center',
     alignItems: 'center',
     shadowColor: '#000',
@@ -126,11 +125,16 @@ const styles = StyleSheet.create({
     shadowRadius: 2,
     elevation: 2,
   },
+  closeIcon: {
+    fontSize: 18,
+    color: '#6B7280',
+    fontWeight: '600',
+  },
   logoContainer: {
-    width: 72,
-    height: 72,
-    borderRadius: 20,
-    backgroundColor: '#EFF6FF',
+    width: 64,
+    height: 64,
+    borderRadius: 16,
+    backgroundColor: '#EBF5FF',
     justifyContent: 'center',
     alignItems: 'center',
     marginBottom: 16,
@@ -139,6 +143,9 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.15,
     shadowRadius: 4,
     elevation: 3,
+  },
+  logoEmoji: {
+    fontSize: 32,
   },
   appTitle: {
     fontSize: 24,
@@ -233,6 +240,11 @@ const styles = StyleSheet.create({
   },
   emojiText: {
     fontSize: 24,
+  },
+  chevronIcon: {
+    fontSize: 20,
+    color: '#9CA3AF',
+    fontWeight: '300',
   },
 });
 

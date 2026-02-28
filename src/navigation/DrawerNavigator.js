@@ -83,3 +83,5 @@ export const AppNavigator = () => {
     </Drawer.Navigator>
   );
 };
+
+export default AppNavigator;

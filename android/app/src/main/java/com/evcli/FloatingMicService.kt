@@ -11,9 +11,12 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.PixelFormat
-import android.media.MediaRecorder
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Log
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -23,33 +26,32 @@ import android.view.WindowManager
 import android.widget.ImageView
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import com.evcli.speech.SpeechTranscriptionService
 import com.facebook.react.ReactApplication
 import com.facebook.react.bridge.ReactContext
 import com.facebook.react.modules.core.DeviceEventManagerModule
-import java.io.File
-import java.io.IOException
+import java.util.ArrayList
 
 class FloatingMicService : Service() {
 
     // ─── RECORDING STATE MACHINE ────────────────────────────────────────
     enum class RecordingState {
         IDLE,           // [ MIC ]
-        RECORDING,      // [ STOP ] [ PAUSE ]
-        PAUSED,         // [ STOP ] [ RESUME ]
-        STOPPED         // Transcribing...
+        RECORDING,      // [ STOP ]
+        STOPPED         // Processing...
     }
 
     private var recordingState = RecordingState.IDLE
-    private var mediaRecorder: MediaRecorder? = null
-    private var audioFile: File? = null
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var recognitionIntent: Intent? = null
     private var aliveCheckHandler: android.os.Handler? = null
     private var aliveCheckRunnable: Runnable? = null
+    
+    // ─── INJECTION LOCK ───────────────────────────────────────────────────
+    private var isInjecting = false
     
     // ─── UI COMPONENTS ───────────────────────────────────────────────────
     private lateinit var windowManager: WindowManager
     private var floatingView: View? = null
-    private var speechTranscriptionService: SpeechTranscriptionService? = null
     private var initialX = 0
     private var initialY = 0
     private var initialTouchX = 0f
@@ -58,8 +60,6 @@ class FloatingMicService : Service() {
     // ─── BUTTON REFERENCES ─────────────────────────────────────────────
     private var btnMic: ImageView? = null
     private var btnStop: ImageView? = null
-    private var btnPause: ImageView? = null
-    private var btnResume: ImageView? = null
     
     // ─── SMART FLOATING MIC CONTROL ────────────────────────────────────────
     private var micControlReceiver: BroadcastReceiver? = null
@@ -76,6 +76,10 @@ class FloatingMicService : Service() {
         // Smart mic control actions
         const val ACTION_SHOW_MIC = "com.evcli.SHOW_MIC"
         const val ACTION_HIDE_MIC = "com.evcli.HIDE_MIC"
+        
+        // Recording control actions
+        const val ACTION_START_RECORDING = "com.evcli.START_RECORDING"
+        const val ACTION_STOP_RECORDING = "com.evcli.STOP_RECORDING"
         
         fun startService(context: Context) {
             val intent = Intent(context, FloatingMicService::class.java)
@@ -98,9 +102,13 @@ class FloatingMicService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification())
         registerMicControlReceiver()
-        initializeSpeechTranscriptionService()
+        
+        // CRITICAL: Initialize and show floating view immediately
+        initializeFloatingView()
+        showFloatingOverlay()
+        
         isServiceReady = true
-        Log.d(TAG, "✅ FloatingMicService created and ready")
+        Log.d(TAG, "✅ FloatingMicService created and ready with mic overlay visible")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -164,8 +172,6 @@ class FloatingMicService : Service() {
             // Get button references
             btnMic = floatingView?.findViewById(R.id.btn_mic)
             btnStop = floatingView?.findViewById(R.id.btn_stop)
-            btnPause = floatingView?.findViewById(R.id.btn_pause)
-            btnResume = floatingView?.findViewById(R.id.btn_resume)
             
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -217,23 +223,13 @@ class FloatingMicService : Service() {
 
     private fun setupButtonListeners() {
         btnMic?.setOnClickListener {
-            Log.d(TAG, "🎤 Mic Pressed → Recording Started")
-            startRecording()
+            Log.d(TAG, "🎤 Mic Pressed → Starting Speech Recognition")
+            startSpeechRecognition()
         }
         
         btnStop?.setOnClickListener {
-            Log.d(TAG, "🛑 Stop Pressed → Recording Stopped")
-            stopRecording()
-        }
-        
-        btnPause?.setOnClickListener {
-            Log.d(TAG, "⏸️ Pause Pressed → Recording Paused")
-            pauseRecording()
-        }
-        
-        btnResume?.setOnClickListener {
-            Log.d(TAG, "▶️ Resume Pressed → Recording Resumed")
-            resumeRecording()
+            Log.d(TAG, "🛑 Stop Pressed → Stopping Speech Recognition")
+            stopSpeechRecognition()
         }
     }
 
@@ -285,208 +281,197 @@ class FloatingMicService : Service() {
         })
     }
 
-    // ─── RECORDING STATE MACHINE METHODS ───────────────────────────────────
+    // ─── SPEECH RECOGNITION METHODS ───────────────────────────────────────
 
-    private fun startRecording() {
+    private fun startSpeechRecognition() {
         if (recordingState != RecordingState.IDLE) {
-            Log.w(TAG, "⚠️ Cannot start recording: Not in IDLE state")
+            Log.w(TAG, "⚠️ Cannot start speech recognition: Not in IDLE state")
             return
         }
         
         try {
-            // Reset injection flags first
-            resetInjectionFlags()
+            Log.d(TAG, "🎤 Starting Speech Recognition")
             
-            Log.d(TAG, "🎤 MIC Pressed")
-            Log.d(TAG, "🔴 Recorder Started")
+            // Reset injection gate for new recording session
+            resetInjectionGate()
             
-            // Create audio file
-            audioFile = File(cacheDir, "recording_${System.currentTimeMillis()}.3gp")
+            // Initialize SpeechRecognizer
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
             
-            // Initialize MediaRecorder for audio recording
-            mediaRecorder = MediaRecorder().apply {
-                setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
-                setOutputFile(audioFile?.absolutePath)
-                
-                try {
-                    prepare()
-                    start()
-                } catch (e: IOException) {
-                    Log.e(TAG, "❌ Failed to start MediaRecorder", e)
-                    release()
-                    mediaRecorder = null
-                    return
-                }
+            // Create recognition intent
+            recognitionIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
             }
             
-            // CRITICAL: Start SpeechRecognizer IMMEDIATELY after recorder starts
-            Log.d(TAG, "🎤 Speech Recognizer Started")
-            startSpeechRecognizer()
+            // Set recognition listener
+            speechRecognizer?.setRecognitionListener(createRecognitionListener())
+            
+            // Start listening
+            speechRecognizer?.startListening(recognitionIntent)
             
             recordingState = RecordingState.RECORDING
             updateUIState()
             sendEventToReactNative("onRecordingStarted", null)
-            showToast("Recording started")
+            showToast("Listening...")
             
-            // Start alive check logging for verification
+            // Start alive check
             startAliveCheck()
             
-            Log.d(TAG, "✅ Recording + Speech Recognition Started Together")
+            Log.d(TAG, "✅ Speech recognition started")
             
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to start recording", e)
-            sendEventToReactNative("onError", "Failed to start recording: ${e.message}")
-            showToast("Failed to start recording")
+            Log.e(TAG, "❌ Failed to start speech recognition", e)
+            sendEventToReactNative("onError", "Failed to start speech recognition: ${e.message}")
+            showToast("Failed to start speech recognition")
             resetToIdleState()
         }
     }
 
-    private fun startSpeechRecognizer() {
-        try {
-            val success = speechTranscriptionService?.startTranscription() ?: false
-            if (!success) {
-                Log.e(TAG, "❌ Failed to start Speech Recognizer")
-                sendEventToReactNative("onError", "Failed to start speech recognition")
-            } else {
-                Log.d(TAG, "✅ Speech Recognizer Started")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error starting Speech Recognizer", e)
-            sendEventToReactNative("onError", "Failed to start speech recognition: ${e.message}")
-        }
-    }
-
-    private fun stopSpeechRecognizer() {
-        try {
-            speechTranscriptionService?.stopTranscription()
-            Log.d(TAG, "✅ Speech Recognizer Stopped")
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error stopping Speech Recognizer", e)
-        }
-    }
-
-    private fun destroySpeechRecognizer() {
-        try {
-            speechTranscriptionService?.cancelTranscription()
-            Log.d(TAG, "✅ Speech Recognizer Destroyed")
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error destroying Speech Recognizer", e)
-        }
-    }
-
-    private fun pauseRecording() {
+    private fun stopSpeechRecognition() {
         if (recordingState != RecordingState.RECORDING) {
-            Log.w(TAG, "⚠️ Cannot pause recording: Not in RECORDING state")
+            Log.w(TAG, "⚠️ Cannot stop speech recognition: Not in RECORDING state")
             return
         }
         
-        try {
-            mediaRecorder?.pause()
-            
-            // CRITICAL: Pause SpeechRecognizer during pause
-            stopSpeechRecognizer()
-            
-            recordingState = RecordingState.PAUSED
-            updateUIState()
-            sendEventToReactNative("onRecordingPaused", null)
-            showToast("Recording paused")
-            
-            Log.d(TAG, "⏸️ Recording Paused - Speech Recognition Paused")
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to pause recording", e)
-            sendEventToReactNative("onError", "Failed to pause recording: ${e.message}")
-            showToast("Failed to pause recording")
-        }
-    }
-
-    private fun resumeRecording() {
-        if (recordingState != RecordingState.PAUSED) {
-            Log.w(TAG, "⚠️ Cannot resume recording: Not in PAUSED state")
-            return
-        }
-        
-        try {
-            mediaRecorder?.resume()
-            
-            // CRITICAL: Resume SpeechRecognizer when recording resumes
-            startSpeechRecognizer()
-            
-            recordingState = RecordingState.RECORDING
-            updateUIState()
-            sendEventToReactNative("onRecordingResumed", null)
-            showToast("Recording resumed")
-            
-            Log.d(TAG, "▶️ Recording Resumed - Speech Recognition Resumed")
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to resume recording", e)
-            sendEventToReactNative("onError", "Failed to resume recording: ${e.message}")
-            showToast("Failed to resume recording")
-        }
-    }
-
-    private fun stopRecording() {
-        if (recordingState != RecordingState.RECORDING && recordingState != RecordingState.PAUSED) {
-            Log.w(TAG, "⚠️ Cannot stop recording: Not in RECORDING or PAUSED state")
-            return
-        }
-        
-        Log.d(TAG, "🛑 STOP Pressed")
+        Log.d(TAG, "🛑 Stopping Speech Recognition")
         
         try {
             // Stop alive check
             stopAliveCheck()
             
-            // CRITICAL: Stop SpeechRecognizer FIRST
-            Log.d(TAG, "🛑 Speech Recognizer Stopped")
-            stopSpeechRecognizer()
-            
-            // CRITICAL: Destroy SpeechRecognizer
-            Log.d(TAG, "🗑️ Speech Recognizer Destroyed")
-            destroySpeechRecognizer()
-            
-            // Stop and release MediaRecorder
-            mediaRecorder?.let { recorder ->
-                try {
-                    recorder.stop()
-                    Log.d(TAG, "🛑 Recorder Stopped")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error stopping recorder", e)
-                }
-                
-                try {
-                    recorder.release()
-                    Log.d(TAG, "🗑️ Recorder Released")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error releasing recorder", e)
-                }
-            }
-            
-            // CRITICAL: Set to null to ensure complete termination
-            mediaRecorder = null
-            Log.d(TAG, "🗑️ Recorder Nullified - Microphone Released")
-            
-            // CRITICAL: Finalize audio file
-            finalizeAudioFile()
+            // Stop speech recognizer
+            speechRecognizer?.stopListening()
             
             recordingState = RecordingState.STOPPED
             updateUIState()
             sendEventToReactNative("onRecordingStopped", null)
-            showToast("Recording stopped")
-            
-            Log.d(TAG, "🔄 Transcription Started")
-            
-            // CRITICAL: Transcribe recorded audio file AFTER both are stopped
-            transcribeRecordedFile()
+            showToast("Processing...")
             
         } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to stop recording", e)
-            sendEventToReactNative("onError", "Failed to stop recording: ${e.message}")
-            showToast("Failed to stop recording")
+            Log.e(TAG, "❌ Failed to stop speech recognition", e)
+            sendEventToReactNative("onError", "Failed to stop speech recognition: ${e.message}")
             resetToIdleState()
+        }
+    }
+
+    private fun createRecognitionListener(): RecognitionListener {
+        return object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                Log.d(TAG, "🎤 Ready for speech")
+            }
+
+            override fun onBeginningOfSpeech() {
+                Log.d(TAG, "🗣️ Beginning of speech")
+            }
+
+            override fun onRmsChanged(rmsdB: Float) {
+                // Audio level changed
+            }
+
+            override fun onBufferReceived(buffer: ByteArray?) {
+                // Audio buffer received
+            }
+
+            override fun onEndOfSpeech() {
+                Log.d(TAG, "🔚 End of speech")
+                // ⚠️ NO INJECTION HERE - only in onResults()
+            }
+
+            override fun onError(error: Int) {
+                val errorMessage = getErrorMessage(error)
+                Log.e(TAG, "❌ Speech recognition error: $errorMessage")
+                sendEventToReactNative("onError", errorMessage)
+                showToast("Error: $errorMessage")
+                // ⚠️ NO INJECTION HERE - only in onResults()
+                resetToIdleState()
+            }
+
+            override fun onResults(results: Bundle?) {
+                // Prevent duplicate injection
+                if (isInjecting) return
+                isInjecting = true
+                
+                try {
+                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val spokenText = matches?.getOrNull(0)?.trim() ?: ""
+    
+                    if (spokenText.isNotEmpty()) {
+                        Log.d(TAG, "✅ Speech recognition result: $spokenText")
+                        injectText(spokenText)
+                        sendEventToReactNative("onTranscriptionComplete", spokenText)
+                        showToast("Text injected")
+                    } else {
+                        Log.w(TAG, "⚠️ No speech recognition results")
+                    }
+                } finally {
+                    isInjecting = false
+                    // Reset to IDLE after processing
+                    resetToIdleState()
+                }
+            }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                if (matches != null && matches.isNotEmpty()) {
+                    val partialText = matches[0]
+                    Log.d(TAG, "🔄 Partial result: $partialText")
+                    sendEventToReactNative("onPartialResult", partialText)
+                }
+                // ⚠️ NO INJECTION HERE - only in onResults()
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) {
+                // Handle events if needed
+            }
+        }
+    }
+
+    private fun getErrorMessage(error: Int): String {
+        return when (error) {
+            SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
+            SpeechRecognizer.ERROR_CLIENT -> "Client side error"
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Insufficient permissions"
+            SpeechRecognizer.ERROR_NETWORK -> "Network error"
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
+            SpeechRecognizer.ERROR_NO_MATCH -> "No speech detected"
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognizer is busy"
+            SpeechRecognizer.ERROR_SERVER -> "Server error"
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Speech timeout"
+            else -> "Unknown recognition error"
+        }
+    }
+
+    /**
+     * Send text to AccessibilityService for injection
+     * This is the ONLY place where injection is triggered
+     */
+    private fun injectText(newText: String) {
+        try {
+            val intent = Intent("com.evcli.VOICE_RESULT").apply {
+                putExtra("transcribed_text", newText)
+                putExtra("timestamp", System.currentTimeMillis())
+            }
+            sendBroadcast(intent)
+            Log.d(TAG, "💉 Text sent to accessibility service: $newText")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to inject text", e)
+        }
+    }
+
+    /**
+     * Reset injection gate in accessibility service for new recording session
+     */
+    private fun resetInjectionGate() {
+        try {
+            val intent = Intent("com.evcli.RESET_INJECTION")
+            sendBroadcast(intent)
+            Log.d(TAG, "🔄 Injection gate reset for new recording session")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to reset injection gate", e)
         }
     }
 
@@ -495,10 +480,7 @@ class FloatingMicService : Service() {
         aliveCheckRunnable = object : Runnable {
             override fun run() {
                 if (recordingState == RecordingState.RECORDING) {
-                    Log.d(TAG, "🔊 Recording Active - Speech Recognition Active")
-                    aliveCheckHandler?.postDelayed(this, 10000) // Log every 10 seconds
-                } else if (recordingState == RecordingState.PAUSED) {
-                    Log.d(TAG, "⏸️ Recording Paused - Speech Recognition Paused")
+                    Log.d(TAG, "🔊 Speech Recognition Active")
                     aliveCheckHandler?.postDelayed(this, 10000) // Log every 10 seconds
                 }
             }
@@ -511,173 +493,36 @@ class FloatingMicService : Service() {
         aliveCheckRunnable = null
         aliveCheckHandler = null
     }
-
-    private fun finalizeAudioFile() {
-        audioFile?.let { file ->
-            try {
-                // Verify file exists and has content
-                if (file.exists()) {
-                    val fileSize = file.length()
-                    Log.d(TAG, "📁 Audio File Finalized: ${file.name}")
-                    Log.d(TAG, "📊 File Size: $fileSize bytes")
-                    
-                    if (fileSize > 0) {
-                        Log.d(TAG, "✅ Audio File Ready for Transcription")
-                    } else {
-                        Log.e(TAG, "❌ Audio File is Empty")
-                    }
-                } else {
-                    Log.e(TAG, "❌ Audio File Not Found After Recording")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Error Finalizing Audio File", e)
-            }
-        } ?: run {
-            Log.e(TAG, "❌ Audio File Reference is Null")
-        }
-    }
-
-    private fun transcribeRecordedFile() {
-        Log.d(TAG, "🔄 Transcribing Recorded File...")
-        
-        audioFile?.let { file ->
-            val audioPath = file.absolutePath
-            Log.d(TAG, "📁 Audio Path = $audioPath")
-            
-            // Verify file exists
-            if (!file.exists()) {
-                Log.e(TAG, "❌ Audio file missing: $audioPath")
-                sendEventToReactNative("onError", "Audio file not found")
-                resetToIdleState()
-                return
-            }
-            
-            // Verify audio size
-            val fileSize = file.length()
-            Log.d(TAG, "📊 Audio file size = $fileSize bytes")
-            
-            if (fileSize == 0L) {
-                Log.e(TAG, "❌ Audio file is empty: 0 bytes")
-                sendEventToReactNative("onError", "Audio file is empty")
-                resetToIdleState()
-                return
-            }
-            
-            Log.d(TAG, "✅ Audio File Ready")
-            
-            // CRITICAL: Start SpeechRecognizer AFTER recording is complete
-            startFileTranscription(file)
-            
-        } ?: run {
-            Log.e(TAG, "❌ Audio file is null")
-            sendEventToReactNative("onError", "Audio file reference is null")
-            resetToIdleState()
-        }
-    }
     
-    private fun startFileTranscription(audioFile: File) {
-        Log.d(TAG, "🔄 Starting File Transcription...")
-        
-        try {
-            // CRITICAL: Create NEW SpeechRecognizer instance for file transcription
-            // This ensures clean separation from live recognition
-            val fileTranscriptionService = SpeechTranscriptionService(this)
-            
-            fileTranscriptionService.setOnTextTranscribed { text ->
-                Log.d(TAG, "📝 Transcription Result = $text")
-                sendEventToReactNative("onTranscriptionResult", text)
-                
-                // Inject text
-                Log.d(TAG, "💉 Injection Started")
-                injectText(text)
-                
-                // Clean up file transcription service
-                fileTranscriptionService.destroy()
-                
-                // Reset to IDLE state after transcription
-                resetToIdleState()
-            }
-            
-            fileTranscriptionService.setOnError { error ->
-                Log.e(TAG, "❌ Transcription error: $error")
-                sendEventToReactNative("onError", "Transcription failed: $error")
-                
-                // Clean up file transcription service
-                fileTranscriptionService.destroy()
-                
-                resetToIdleState()
-            }
-            
-            fileTranscriptionService.setOnStateChanged { isTranscribing ->
-                Log.d(TAG, "File Transcription state: $isTranscribing")
-            }
-            
-            // Start transcription for the recorded file
-            val success = fileTranscriptionService.startTranscription()
-            
-            if (!success) {
-                Log.e(TAG, "❌ Failed to start file transcription service")
-                sendEventToReactNative("onError", "Failed to start transcription service")
-                fileTranscriptionService.destroy()
-                resetToIdleState()
-            }
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to start file transcription", e)
-            sendEventToReactNative("onError", "Failed to start transcription: ${e.message}")
-            resetToIdleState()
-        }
-    }
-
-    private fun injectText(text: String) {
-        try {
-            val intent = Intent("com.evcli.VOICE_RESULT").apply {
-                putExtra("transcribed_text", text)
-                putExtra("timestamp", System.currentTimeMillis())
-            }
-            sendBroadcast(intent)
-            Log.d(TAG, "✅ Text injected: $text")
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to inject text", e)
-        }
-    }
-
     private fun resetToIdleState() {
-        // Clean up audio file
-        audioFile?.let { file ->
-            if (file.exists()) {
-                file.delete()
-            }
-        }
-        audioFile = null
-        
         // Stop alive check
         stopAliveCheck()
         
-        // CRITICAL: Ensure SpeechRecognizer is completely stopped
-        stopSpeechRecognizer()
-        destroySpeechRecognizer()
+        // Reset injection lock
+        isInjecting = false
+        
+        // Destroy speech recognizer properly
+        speechRecognizer?.let { recognizer ->
+            try {
+                recognizer.stopListening()
+                recognizer.cancel()
+                recognizer.destroy()
+                Log.d(TAG, "✅ SpeechRecognizer destroyed properly")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error destroying SpeechRecognizer", e)
+            }
+        }
+        speechRecognizer = null
+        recognitionIntent = null
         
         // Reset state
         recordingState = RecordingState.IDLE
         updateUIState()
         
-        Log.d(TAG, "🔄 Reset to IDLE state - Speech Recognition Destroyed")
+        Log.d(TAG, "🔄 Reset to IDLE state - SpeechRecognizer destroyed")
     }
     
-    /**
-     * Reset injection flags in AccessibilityService for new recording
-     */
-    private fun resetInjectionFlags() {
-        try {
-            val intent = Intent("com.evcli.RESET_INJECTION")
-            sendBroadcast(intent)
-            Log.d(TAG, "🔄 Sent injection reset broadcast")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error sending reset broadcast", e)
-        }
-    }
-
+    
     // ─── UI STATE MANAGEMENT ───────────────────────────────────────────────
 
     private fun updateUIState() {
@@ -685,42 +530,19 @@ class FloatingMicService : Service() {
             RecordingState.IDLE -> {
                 btnMic?.visibility = View.VISIBLE
                 btnStop?.visibility = View.GONE
-                btnPause?.visibility = View.GONE
-                btnResume?.visibility = View.GONE
             }
             RecordingState.RECORDING -> {
                 btnMic?.visibility = View.GONE
                 btnStop?.visibility = View.VISIBLE
-                btnPause?.visibility = View.VISIBLE
-                btnResume?.visibility = View.GONE
-            }
-            RecordingState.PAUSED -> {
-                btnMic?.visibility = View.GONE
-                btnStop?.visibility = View.VISIBLE
-                btnPause?.visibility = View.GONE
-                btnResume?.visibility = View.VISIBLE
             }
             RecordingState.STOPPED -> {
-                btnMic?.visibility = View.GONE
+                btnMic?.visibility = View.VISIBLE
                 btnStop?.visibility = View.GONE
-                btnPause?.visibility = View.GONE
-                btnResume?.visibility = View.GONE
             }
         }
     }
 
-    private fun initializeSpeechTranscriptionService() {
-        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) 
-            != PackageManager.PERMISSION_GRANTED) {
-            Log.e(TAG, "❌ RECORD_AUDIO permission not granted")
-            sendEventToReactNative("onError", "RECORD_AUDIO permission not granted")
-            return
-        }
-
-        speechTranscriptionService = SpeechTranscriptionService(this)
-        Log.d(TAG, "✅ Speech transcription service initialized")
-    }
-    
+        
     private fun showToast(message: String) {
         try {
             android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_SHORT).show()
@@ -758,7 +580,7 @@ class FloatingMicService : Service() {
     // ─── SMART FLOATING MIC CONTROL ───────────────────────────────────────────
     
     /**
-     * Register broadcast receiver for show/hide mic commands
+     * Register broadcast receiver for show/hide mic and recording commands
      */
     private fun registerMicControlReceiver() {
         micControlReceiver = object : BroadcastReceiver() {
@@ -772,6 +594,14 @@ class FloatingMicService : Service() {
                         Log.d(TAG, "🔇 Received hide mic command")
                         hideFloatingOverlay()
                     }
+                    ACTION_START_RECORDING -> {
+                        Log.d(TAG, "🎤 Received start recording command")
+                        startSpeechRecognition()
+                    }
+                    ACTION_STOP_RECORDING -> {
+                        Log.d(TAG, "🛑 Received stop recording command")
+                        stopSpeechRecognition()
+                    }
                 }
             }
         }
@@ -779,9 +609,11 @@ class FloatingMicService : Service() {
         val filter = IntentFilter().apply {
             addAction(ACTION_SHOW_MIC)
             addAction(ACTION_HIDE_MIC)
+            addAction(ACTION_START_RECORDING)
+            addAction(ACTION_STOP_RECORDING)
         }
         registerReceiver(micControlReceiver, filter)
-        Log.d(TAG, "✅ Mic control receiver registered")
+        Log.d(TAG, "✅ Mic and recording control receiver registered")
     }
     
     /**
@@ -821,32 +653,22 @@ class FloatingMicService : Service() {
         // Stop alive check
         stopAliveCheck()
         
-        // Stop recording if active - CRITICAL: Proper release
-        if (recordingState == RecordingState.RECORDING || recordingState == RecordingState.PAUSED) {
-            mediaRecorder?.let { recorder ->
+        // Stop speech recognition if active
+        if (recordingState == RecordingState.RECORDING) {
+            speechRecognizer?.let { recognizer ->
                 try {
-                    recorder.stop()
-                    Log.d(TAG, "✅ Recorder Stopped (onDestroy)")
+                    recognizer.destroy()
+                    Log.d(TAG, "✅ SpeechRecognizer destroyed (onDestroy)")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error stopping recorder (onDestroy)", e)
-                }
-                
-                try {
-                    recorder.release()
-                    Log.d(TAG, "✅ Recorder Released (onDestroy)")
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error releasing recorder (onDestroy)", e)
+                    Log.e(TAG, "Error destroying SpeechRecognizer (onDestroy)", e)
                 }
             }
-            mediaRecorder = null
-            Log.d(TAG, "✅ Recorder Nullified (onDestroy)")
+            speechRecognizer = null
+            Log.d(TAG, "✅ SpeechRecognizer nullified (onDestroy)")
         }
         
         // Clean up broadcast receiver
         micControlReceiver?.let { unregisterReceiver(it) }
-        
-        speechTranscriptionService?.destroy()
-        speechTranscriptionService = null
         
         floatingView?.let { view ->
             try {
@@ -861,6 +683,5 @@ class FloatingMicService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        stopSelf()
     }
 }

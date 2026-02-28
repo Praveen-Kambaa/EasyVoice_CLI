@@ -45,6 +45,39 @@ class FloatingMicModule(reactContext: ReactApplicationContext) : ReactContextBas
     }
 
     @ReactMethod
+    fun startRecording(promise: Promise) {
+        try {
+            val context = reactApplicationContext
+            
+            if (!hasRecordAudioPermission(context)) {
+                promise.reject("RECORD_AUDIO_PERMISSION_DENIED", "Record audio permission not granted")
+                return
+            }
+            
+            // Start recording via broadcast to service
+            val intent = Intent("com.evcli.START_RECORDING")
+            context.sendBroadcast(intent)
+            promise.resolve("Recording started")
+        } catch (e: Exception) {
+            promise.reject("RECORDING_START_ERROR", "Failed to start recording: ${e.message}")
+        }
+    }
+
+    @ReactMethod
+    fun stopRecording(promise: Promise) {
+        try {
+            val context = reactApplicationContext
+            
+            // Stop recording via broadcast to service
+            val intent = Intent("com.evcli.STOP_RECORDING")
+            context.sendBroadcast(intent)
+            promise.resolve("Recording stop requested")
+        } catch (e: Exception) {
+            promise.reject("RECORDING_STOP_ERROR", "Failed to stop recording: ${e.message}")
+        }
+    }
+
+    @ReactMethod
     fun stopFloatingMic(promise: Promise) {
         try {
             FloatingMicService.stopService(reactApplicationContext)
@@ -108,6 +141,21 @@ class FloatingMicModule(reactContext: ReactApplicationContext) : ReactContextBas
         // Required for event emitter
     }
 
+    @ReactMethod
+    fun injectText(text: String, promise: Promise) {
+        try {
+            val context = reactApplicationContext
+            val intent = Intent("com.evcli.VOICE_RESULT").apply {
+                putExtra("transcribed_text", text)
+                putExtra("timestamp", System.currentTimeMillis())
+            }
+            context.sendBroadcast(intent)
+            promise.resolve("Text injected successfully")
+        } catch (e: Exception) {
+            promise.reject("INJECTION_ERROR", "Failed to inject text: ${e.message}")
+        }
+    }
+
     private fun hasOverlayPermission(context: Context): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             Settings.canDrawOverlays(context)
@@ -132,7 +180,7 @@ class FloatingMicModule(reactContext: ReactApplicationContext) : ReactContextBas
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         )
         
-        val serviceName = "${context.packageName}/${context.packageName}.services.MyAccessibilityService"
+        val serviceName = "${context.packageName}/${context.packageName}.MyAccessibilityService"
         return enabledServices?.contains(serviceName) == true || 
                accessibilityManager.getEnabledAccessibilityServiceList(0).any { 
                    it.resolveInfo.serviceInfo.packageName == context.packageName 

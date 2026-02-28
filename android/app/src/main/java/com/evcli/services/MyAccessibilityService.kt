@@ -3,11 +3,10 @@ package com.evcli.services
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.BroadcastReceiver
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -37,8 +36,7 @@ class MyAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private var isServiceReady = false
     
-    // ─── SMART FLOATING MIC CONTROL ────────────────────────────────────────
-    private var hideMicRunnable: Runnable? = null
+    // ─── FLOATING MIC CONTROL ───────────────────────────────────────────────
     private var isMicVisible = false
     
     companion object {
@@ -60,11 +58,6 @@ class MyAccessibilityService : AccessibilityService() {
         // after focus changes; does NOT use Thread.sleep).
         private const val INJECTION_DELAY_MS = 200L
 
-        // Clipboard settle delay (no Thread.sleep — used in postDelayed).
-        private const val CLIPBOARD_SETTLE_MS = 150L
-        
-        // Delay before hiding mic when text field loses focus
-        private const val HIDE_MIC_DELAY_MS = 300L
         
         // ─── CENTRAL INJECTION GATE ────────────────────────────────────────────
         // A SINGLE AtomicBoolean is the only guard for concurrent injection.
@@ -90,20 +83,14 @@ class MyAccessibilityService : AccessibilityService() {
 
     private fun configureService() {
         val info = AccessibilityServiceInfo().apply {
-            // Subscribe to events needed for text field detection and injection
-            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                    AccessibilityEvent.TYPE_VIEW_FOCUSED or
-                    AccessibilityEvent.TYPE_VIEW_CLICKED or
-                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-
+            eventTypes = AccessibilityEvent.TYPE_VIEW_FOCUSED or
+                    AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-
             flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                     AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                     AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-
             packageNames = null
-            notificationTimeout = 50
+            notificationTimeout = 100
         }
         serviceInfo = info
         Log.d(TAG, "Service configured")
@@ -173,29 +160,33 @@ class MyAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        when (event?.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                Log.v(TAG, "Window changed: ${event.packageName}")
-                // Check for text fields when window changes
-                detectAndHandleTextField()
+        if (!isServiceReady) return
+        
+        // Only handle focus-related events
+        if (event?.eventType != AccessibilityEvent.TYPE_VIEW_FOCUSED &&
+            event?.eventType != AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED) return
+        
+        val root = rootInActiveWindow
+        if (root == null) {
+            Log.d(TAG, "Root is null - hiding mic")
+            hideFloatingMic()
+            return
+        }
+        
+        val focusedNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        
+        try {
+            if (focusedNode != null && 
+                focusedNode.isEditable && 
+                focusedNode.isFocused) {
+                Log.d(TAG, "Showing floating mic - editable field focused")
+                showFloatingMic()
+            } else {
+                Log.d(TAG, "Hiding floating mic - no editable focused field")
+                hideFloatingMic()
             }
-            AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
-                Log.v(TAG, "View focused: ${event.className}")
-                // Immediately check for text field focus
-                detectAndHandleTextField()
-            }
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                Log.v(TAG, "View clicked: ${event.className}")
-                // Check for text field when view is clicked
-                detectAndHandleTextField()
-            }
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                // Only process if content change might affect text fields
-                if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-                    // Check immediately without delay for real-time response
-                    detectAndHandleTextField()
-                }
-            }
+        } finally {
+            focusedNode?.recycle()
         }
     }
 
@@ -208,7 +199,6 @@ class MyAccessibilityService : AccessibilityService() {
         super.onDestroy()
         isServiceReady = false
         handler.removeCallbacksAndMessages(null)
-        hideMicRunnable?.let { handler.removeCallbacks(it) }
         voiceResultReceiver?.let { r ->
             runCatching { unregisterReceiver(r) }
         }
@@ -231,117 +221,57 @@ class MyAccessibilityService : AccessibilityService() {
         }
 
         Log.d(TAG, "=== SINGLE INJECTION ATTEMPT — text: \"$text\" ===")
-
-        val rootNode = getRootNodeSafely()
-        if (rootNode == null) {
-            Log.e(TAG, "❌ Root node unavailable — aborting, gate released")
-            injectionInProgress.set(false)
-            return
-        }
-
         try {
-            val targetNode = findBestInputNode(rootNode)
-            if (targetNode == null) {
-                Log.e(TAG, "❌ No suitable text field found — aborting, gate released")
-                injectionInProgress.set(false)
-                showToast("No focusable text field found")
-                return
-            }
-
-            // Focus the target field first.
-            targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-
-            // ── PRIMARY PATH: ACTION_SET_TEXT ─────────────────────────────
-            // Trust the boolean return value of performAction.
-            // If it returns true, text was injected — DONE. No fallback.
-            val setTextSuccess = tryActionSetText(targetNode, text)
-            if (setTextSuccess) {
+            val success = injectText(text)
+            if (success) {
                 onInjectionSuccess(text, "ACTION_SET_TEXT")
-                targetNode.recycle()
-                rootNode.recycle()
-                return
+            } else {
+                injectionInProgress.set(false)
             }
-
-            // ── FALLBACK PATH: Clipboard paste ────────────────────────────
-            // Only reached if ACTION_SET_TEXT returned false.
-            Log.d(TAG, "⚠️  ACTION_SET_TEXT returned false — trying clipboard paste")
-            tryClipboardPaste(targetNode, text) {
-                // This callback fires after the clipboard settle delay.
-                onInjectionSuccess(text, "clipboard paste")
-            }
-
-            targetNode.recycle()
-
         } catch (e: Exception) {
             Log.e(TAG, "❌ Exception during injection", e)
             injectionInProgress.set(false)
-        } finally {
-            // rootNode recycle is inside the try block for the success path.
-            // For exceptions, recycle here if it wasn't already recycled.
-            runCatching { rootNode.recycle() }
-        }
-    }
-
-    // ─── INJECTION HELPERS ────────────────────────────────────────────────────
-
-    /**
-     * Attempt ACTION_SET_TEXT.
-     * Returns true if the system confirmed the action succeeded.
-     * Does NOT block the thread.
-     */
-    private fun tryActionSetText(node: AccessibilityNodeInfo, text: String): Boolean {
-        return try {
-            val args = Bundle().apply {
-                putCharSequence(
-                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                    text
-                )
-            }
-            val result = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-            Log.d(TAG, "ACTION_SET_TEXT result: $result")
-            result
-        } catch (e: Exception) {
-            Log.e(TAG, "ACTION_SET_TEXT exception", e)
-            false
         }
     }
 
     /**
-     * Copy text to clipboard then schedule ACTION_PASTE via handler (no Thread.sleep).
-     * The [onSuccess] lambda is invoked only if ACTION_PASTE returns true.
+     * Strict injection into the current focused EditText only.
+     * NO fallback logic, NO scanning, NO heuristics.
+     * REPLACES existing text to prevent prefix issues.
      */
-    private fun tryClipboardPaste(
-        node: AccessibilityNodeInfo,
-        text: String,
-        onSuccess: () -> Unit
-    ) {
+    private fun injectText(newText: String): Boolean {
+        val node = rootInActiveWindow
+            ?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            ?: return false
+
         try {
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("voice_input", text))
-            Log.d(TAG, "Text copied to clipboard")
-        } catch (e: Exception) {
-            Log.e(TAG, "Clipboard write failed", e)
-            injectionInProgress.set(false)
-            return
-        }
+            if (
+                node.className != "android.widget.EditText" ||
+                !node.isEditable
+            ) return false
 
-        // Wait for the clipboard to be ready without blocking the main thread.
-        handler.postDelayed({
-            try {
-                val pasteResult = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                Log.d(TAG, "ACTION_PASTE result: $pasteResult")
-                if (pasteResult) {
-                    onSuccess()
-                } else {
-                    Log.e(TAG, "❌ Both injection methods failed — gate released")
-                    showToast("Text injection failed")
-                    injectionInProgress.set(false)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "ACTION_PASTE exception", e)
-                injectionInProgress.set(false)
+            val currentText = node.text?.toString()?.trim() ?: ""
+            val textToInject = if (currentText.isNotEmpty()) {
+                "$currentText $newText"
+            } else {
+                newText
             }
-        }, CLIPBOARD_SETTLE_MS)
+
+            Log.d(TAG, "💉 Injection: existing='$currentText', new='$newText', final='$textToInject'")
+
+            val args = Bundle()
+            args.putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                textToInject
+            )
+
+            return node.performAction(
+                AccessibilityNodeInfo.ACTION_SET_TEXT,
+                args
+            )
+        } finally {
+            node.recycle()
+        }
     }
 
     /**
@@ -357,95 +287,6 @@ class MyAccessibilityService : AccessibilityService() {
         // NOTE: intentionally do NOT call injectionInProgress.set(false) here.
         // The gate stays locked until the user starts a new recording session
         // (FloatingMicService sends ACTION_RESET_INJECTION).
-    }
-
-    // ─── NODE FINDING — TIGHTENED CRITERIA ───────────────────────────────────
-
-    /**
-     * Find the best input node from the accessibility tree.
-     * Priority:
-     *  1. Node with input focus that is editable.
-     *  2. Any editable node visible to user.
-     * We do NOT fall back to "isFocusable || isClickable" — that's too broad.
-     */
-    private fun findBestInputNode(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        // First: try the node that currently has input focus.
-        val focused = rootNode.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        if (focused != null && isStrictlyEditable(focused)) {
-            Log.d(TAG, "✅ Found focused editable node: ${focused.className}")
-            return focused
-        }
-        focused?.recycle()
-
-        // Second: walk the tree for any visible editable field.
-        val candidates = mutableListOf<AccessibilityNodeInfo>()
-        collectEditableNodes(rootNode, candidates)
-
-        if (candidates.isEmpty()) {
-            Log.e(TAG, "No editable nodes found in tree")
-            return null
-        }
-
-        // Prefer the first focused one, else the first found.
-        val best = candidates.find { it.isFocused } ?: candidates.first()
-        Log.d(TAG, "✅ Best candidate: class=${best.className}, focused=${best.isFocused}")
-
-        // Recycle all candidates except the selected one.
-        candidates.filter { it != best }.forEach { it.recycle() }
-        return best
-    }
-
-    /**
-     * Strict editable check:
-     * The node must be editable (framework flag) AND enabled AND visible.
-     * No guessing from class name alone.
-     */
-    private fun isStrictlyEditable(node: AccessibilityNodeInfo): Boolean {
-        return node.isEditable && node.isEnabled && node.isVisibleToUser
-    }
-
-    /**
-     * Class-name based check as a secondary signal (only for tree walk).
-     * Used together with isEnabled + isVisibleToUser — never alone.
-     */
-    private fun isEditableByClassName(className: String): Boolean {
-        return className.contains("EditText", ignoreCase = true) ||
-                className.contains("TextInput", ignoreCase = true) ||
-                className.contains("AutoComplete", ignoreCase = true) ||
-                className.contains("TextField", ignoreCase = true)
-    }
-
-    private fun collectEditableNodes(
-        node: AccessibilityNodeInfo,
-        result: MutableList<AccessibilityNodeInfo>
-    ) {
-        val className = node.className?.toString() ?: ""
-
-        // Accept if strictly editable OR if class name strongly suggests an input
-        // AND the node is enabled and visible.
-        val isCandidate = isStrictlyEditable(node) ||
-                (isEditableByClassName(className) && node.isEnabled && node.isVisibleToUser)
-
-        if (isCandidate) {
-            result.add(AccessibilityNodeInfo.obtain(node))
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            try {
-                collectEditableNodes(child, result)
-            } finally {
-                child.recycle()
-            }
-        }
-    }
-
-    // ─── ROOT NODE ────────────────────────────────────────────────────────────
-
-    private fun getRootNodeSafely(): AccessibilityNodeInfo? {
-        val root = rootInActiveWindow
-        if (root == null) Log.w(TAG, "rootInActiveWindow is null")
-        return root
     }
 
     // ─── GATE MANAGEMENT ─────────────────────────────────────────────────────
@@ -476,126 +317,6 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
     
-    // ─── SMART FLOATING MIC DETECTION ───────────────────────────────────────────
-    
-    /**
-     * Detect active text fields and show/hide floating mic accordingly
-     */
-    private fun detectAndHandleTextField() {
-        if (!isServiceReady) return
-        
-        val rootNode = getRootNodeSafely() ?: return
-        
-        try {
-            val hasActiveTextField = detectActiveTextField(rootNode)
-            
-            if (hasActiveTextField) {
-                // Cancel any pending hide operation
-                hideMicRunnable?.let { handler.removeCallbacks(it) }
-                
-                if (!isMicVisible) {
-                    Log.d(TAG, "📝 EditText Focused → Show Mic")
-                    showFloatingMic()
-                }
-            } else {
-                // Hide immediately without delay
-                hideMicRunnable?.let { handler.removeCallbacks(it) }
-                
-                if (isMicVisible) {
-                    Log.d(TAG, "📱 Focus Lost → Hide Mic")
-                    hideFloatingMic()
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in text field detection", e)
-        } finally {
-            rootNode.recycle()
-        }
-    }
-    
-    /**
-     * Detect if there's an active text field using the specified priority rules
-     */
-    private fun detectActiveTextField(rootNode: AccessibilityNodeInfo): Boolean {
-        // Priority 1: Check for focused editable node
-        val focusedNode = rootNode.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        if (focusedNode != null) {
-            val isEditable = isTextFieldNode(focusedNode)
-            focusedNode.recycle()
-            if (isEditable) {
-                Log.d(TAG, "✅ Found focused editable text field")
-                return true
-            }
-        }
-        
-        // Priority 2: Search for any editable node in the tree
-        val editableNodes = mutableListOf<AccessibilityNodeInfo>()
-        collectTextFieldNodes(rootNode, editableNodes)
-        
-        // Check if any node is focused and editable
-        val focusedEditable = editableNodes.find { it.isFocused }
-        if (focusedEditable != null) {
-            Log.d(TAG, "✅ Found focused editable node in tree: ${focusedEditable.className}")
-            editableNodes.forEach { it.recycle() }
-            return true
-        }
-        
-        // Clean up
-        editableNodes.forEach { it.recycle() }
-        
-        Log.v(TAG, "No active text field detected")
-        return false
-    }
-    
-    /**
-     * Check if a node is a text field using the specified priority rules
-     */
-    private fun isTextFieldNode(node: AccessibilityNodeInfo): Boolean {
-        // Priority 1: node.isEditable == true
-        if (node.isEditable) {
-            Log.v(TAG, "Text field detected by isEditable flag")
-            return true
-        }
-        
-        // Priority 2: className contains EditText
-        val className = node.className?.toString() ?: ""
-        if (className.contains("EditText", ignoreCase = true)) {
-            Log.v(TAG, "Text field detected by EditText className")
-            return true
-        }
-        
-        // Priority 3: node.isFocusable == true AND node.isClickable == true AND node.text is empty
-        if (node.isFocusable && node.isClickable) {
-            val text = node.text?.toString() ?: ""
-            if (text.isEmpty()) {
-                Log.v(TAG, "Text field detected by focusable+clickable+empty text")
-                return true
-            }
-        }
-        
-        return false
-    }
-    
-    /**
-     * Collect all potential text field nodes from the accessibility tree
-     */
-    private fun collectTextFieldNodes(
-        node: AccessibilityNodeInfo,
-        result: MutableList<AccessibilityNodeInfo>
-    ) {
-        if (isTextFieldNode(node)) {
-            result.add(AccessibilityNodeInfo.obtain(node))
-        }
-        
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            try {
-                collectTextFieldNodes(child, result)
-            } finally {
-                child.recycle()
-            }
-        }
-    }
     
     /**
      * Show the floating mic overlay
@@ -624,4 +345,5 @@ class MyAccessibilityService : AccessibilityService() {
             Log.e(TAG, "Error hiding floating mic", e)
         }
     }
+    
 }

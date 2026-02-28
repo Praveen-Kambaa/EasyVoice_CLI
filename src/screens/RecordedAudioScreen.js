@@ -1,15 +1,17 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, FlatList, Alert, TouchableOpacity, RefreshControl } from 'react-native';
+import { View, Text, StyleSheet, FlatList, Alert, TouchableOpacity, RefreshControl, TextInput, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import AudioRecorderService from '../services/AudioRecorderService';
-import { AudioStorageService } from '../services/AudioStorageService';
-import { uploadAudio } from '../services/api/audioApi';
+import NativeAudioService from '../services/NativeAudioService';
+import { voiceApi } from '../api/voiceApi';
 
 const RecordedAudioScreen = ({ navigation }) => {
   const [recordings, setRecordings] = useState([]);
   const [loading, setLoading] = useState(false);
   const [playingStates, setPlayingStates] = useState({});
   const [refreshing, setRefreshing] = useState(false);
+  const [editingTranscript, setEditingTranscript] = useState(null);
+  const [transcriptText, setTranscriptText] = useState('');
+  const [executingStates, setExecutingStates] = useState({});
 
   useEffect(() => {
     loadRecordings();
@@ -17,7 +19,7 @@ const RecordedAudioScreen = ({ navigation }) => {
 
   const loadRecordings = async () => {
     try {
-      const storedRecordings = await AudioStorageService.getRecordings();
+      const storedRecordings = await NativeAudioService.getAllRecordings();
       setRecordings(storedRecordings.reverse()); // Show newest first
     } catch (error) {
       console.error('Error loading recordings:', error);
@@ -33,7 +35,7 @@ const RecordedAudioScreen = ({ navigation }) => {
   const handlePlay = async (filePath, recordingId) => {
     try {
       setPlayingStates(prev => ({ ...prev, [recordingId]: 'playing' }));
-      const result = await AudioRecorderService.startPlayback(filePath);
+      const result = await NativeAudioService.playRecording(filePath);
       
       if (!result.success) {
         Alert.alert('Error', result.error);
@@ -48,18 +50,28 @@ const RecordedAudioScreen = ({ navigation }) => {
   const handlePause = async (recordingId) => {
     try {
       setPlayingStates(prev => ({ ...prev, [recordingId]: 'paused' }));
-      await AudioRecorderService.pausePlayback();
+      const result = await NativeAudioService.pausePlayback();
+      
+      if (!result.success) {
+        setPlayingStates(prev => ({ ...prev, [recordingId]: 'stopped' }));
+      }
     } catch (error) {
       Alert.alert('Error', 'Failed to pause audio');
+      setPlayingStates(prev => ({ ...prev, [recordingId]: 'stopped' }));
     }
   };
 
   const handleStop = async (recordingId) => {
     try {
       setPlayingStates(prev => ({ ...prev, [recordingId]: 'stopped' }));
-      await AudioRecorderService.stopPlayback();
+      const result = await NativeAudioService.stopPlayback();
+      
+      if (!result.success) {
+        Alert.alert('Error', result.error);
+      }
     } catch (error) {
       Alert.alert('Error', 'Failed to stop audio');
+      setPlayingStates(prev => ({ ...prev, [recordingId]: 'stopped' }));
     }
   };
 
@@ -74,7 +86,7 @@ const RecordedAudioScreen = ({ navigation }) => {
           style: 'destructive',
           onPress: async () => {
             try {
-              const result = await AudioStorageService.deleteRecording(recordingId);
+              const result = await NativeAudioService.deleteRecording(recordingId);
               if (result.success) {
                 await loadRecordings();
                 Alert.alert('Success', 'Recording deleted successfully');
@@ -90,21 +102,126 @@ const RecordedAudioScreen = ({ navigation }) => {
     );
   };
 
-  const handleUpload = async (recording) => {
+  const handleEditTranscript = (recording) => {
+    setEditingTranscript(recording.id);
+    setTranscriptText(recording.refinedTranscript || recording.rawTranscript || '');
+  };
+
+  const handleSaveTranscript = async (recording) => {
     try {
-      setLoading(true);
-      const result = await uploadAudio(recording.filePath);
+      // Check if transcript has changed
+      const originalTranscript = recording.refinedTranscript || recording.rawTranscript;
+      const hasChanged = transcriptText.trim() !== originalTranscript;
+
+      if (hasChanged) {
+        // Update transcript via API
+        const updateResult = await voiceApi.updateTranscript(recording.voiceAssetId, transcriptText.trim());
+        
+        if (updateResult.success) {
+          // Update local recording
+          const updatedRecording = {
+            ...recording,
+            refinedTranscript: transcriptText.trim(),
+            updatedAt: new Date().toISOString(),
+          };
+          
+          await NativeAudioService.updateRecordingTranscript(recording.id, updatedRecording);
+          
+          // Update recordings list
+          setRecordings(prev => prev.map(r => r.id === recording.id ? updatedRecording : r));
+          
+          Alert.alert('Success', 'Transcript updated successfully!');
+        } else {
+          Alert.alert('Error', updateResult.error);
+          return;
+        }
+      }
+
+      setEditingTranscript(null);
+      setTranscriptText('');
+    } catch (error) {
+      Alert.alert('Error', 'Failed to save transcript');
+    }
+  };
+
+  const handleExecuteVoiceCommand = async (recording) => {
+    try {
+      setExecutingStates(prev => ({ ...prev, [recording.id]: true }));
+
+      // Get current transcript text (either from editing state or saved transcript)
+      const currentTranscript = isEditing ? transcriptText.trim() : (recording.refinedTranscript || recording.rawTranscript);
+      const originalTranscript = recording.rawTranscript;
       
-      if (result.success) {
-        Alert.alert('Success', 'Audio uploaded successfully!');
+      console.log('[RecordedAudioScreen] Executing voice command');
+      console.log('[RecordedAudioScreen] Original transcript:', originalTranscript);
+      console.log('[RecordedAudioScreen] Current transcript:', currentTranscript);
+      console.log('[RecordedAudioScreen] Is editing:', isEditing);
+
+      let voiceAssetId = recording.voiceAssetId;
+      let hasChanged = currentTranscript !== originalTranscript;
+
+      // If transcript has changed and we're not in edit mode, update it first
+      if (hasChanged && !isEditing && recording.voiceAssetId) {
+        console.log('[RecordedAudioScreen] Transcript changed, updating with PUT first');
+        const updateResult = await voiceApi.updateTranscript(recording.voiceAssetId, currentTranscript);
+        
+        if (updateResult.success) {
+          voiceAssetId = updateResult.data.voiceAssetId;
+          console.log('[RecordedAudioScreen] Transcript updated successfully');
+          
+          // Update local recording state
+          const updatedRecording = {
+            ...recording,
+            refinedTranscript: currentTranscript,
+            updatedAt: new Date().toISOString(),
+          };
+          
+          await NativeAudioService.updateRecordingTranscript(recording.id, updatedRecording);
+          setRecordings(prev => prev.map(r => r.id === recording.id ? updatedRecording : r));
+        } else {
+          throw new Error(`Failed to update transcript: ${updateResult.error}`);
+        }
+      }
+      
+      // If in edit mode, save first then execute
+      if (isEditing) {
+        console.log('[RecordedAudioScreen] In edit mode, saving transcript first');
+        await handleSaveTranscript(recording);
+        // Get the updated voiceAssetId after saving
+        const updatedRecording = recordings.find(r => r.id === recording.id);
+        voiceAssetId = updatedRecording?.voiceAssetId || recording.voiceAssetId;
+      }
+
+      // Execute voice command with POST
+      console.log('[RecordedAudioScreen] Executing voice command with POST');
+      const executeResult = await voiceApi.executeVoiceCommand(voiceAssetId, {
+        timestamp: new Date().toISOString(),
+      });
+
+      if (executeResult.success) {
+        console.log('[RecordedAudioScreen] Command executed successfully');
+        Alert.alert(
+          'Command Executed! 🎉',
+          `Your voice command has been processed successfully.\n\n${hasChanged ? '(Transcript was updated before execution)' : '(Original transcript used)'}`,
+          [
+            { text: 'OK', style: 'cancel' },
+            { text: 'View Result', onPress: () => console.log('Navigate to result screen') }
+          ]
+        );
       } else {
-        Alert.alert('Error', result.error);
+        throw new Error(executeResult.error);
       }
     } catch (error) {
-      Alert.alert('Error', 'Failed to upload audio');
+      console.error('[RecordedAudioScreen] Execution failed:', error);
+      Alert.alert('Execution Failed', error.message || 'Failed to execute voice command');
     } finally {
-      setLoading(false);
+      setExecutingStates(prev => ({ ...prev, [recording.id]: false }));
     }
+  };
+
+  const handleCancelEdit = () => {
+    setEditingTranscript(null);
+    setTranscriptText('');
   };
 
   const formatDuration = (milliseconds) => {
@@ -128,6 +245,8 @@ const RecordedAudioScreen = ({ navigation }) => {
 
   const renderRecordingItem = ({ item }) => {
     const playingState = playingStates[item.id] || 'stopped';
+    const isEditing = editingTranscript === item.id;
+    const isExecuting = executingStates[item.id] || false;
     
     return (
       <View style={styles.recordingItem}>
@@ -150,6 +269,75 @@ const RecordedAudioScreen = ({ navigation }) => {
             </View>
           </View>
         </View>
+
+        {/* Transcript Section */}
+        {(item.rawTranscript || item.refinedTranscript) && (
+          <View style={styles.transcriptSection}>
+            {isEditing ? (
+              <View style={styles.editContainer}>
+                <TextInput
+                  style={styles.transcriptInput}
+                  multiline
+                  value={transcriptText}
+                  onChangeText={setTranscriptText}
+                  placeholder="Edit transcript..."
+                  autoFocus
+                />
+                <View style={styles.editActions}>
+                  <TouchableOpacity
+                    style={[styles.editButton, styles.saveButton]}
+                    onPress={() => handleSaveTranscript(item)}
+                  >
+                    <Text style={styles.editButtonText}>💾 Save</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.editButton, styles.sendButton]}
+                    onPress={() => handleExecuteVoiceCommand(item)}
+                    disabled={executingStates[item.id]}
+                  >
+                    {executingStates[item.id] ? (
+                      <ActivityIndicator size="small" color="#FFFFFF" />
+                    ) : (
+                      <Text style={styles.editButtonText}>📤 Send</Text>
+                    )}
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.editButton, styles.cancelButton]}
+                    onPress={handleCancelEdit}
+                  >
+                    <Text style={styles.editButtonText}>❌ Cancel</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : (
+              <View style={styles.transcriptDisplay}>
+                <Text style={styles.transcriptLabel}>📝 Transcript:</Text>
+                <Text style={styles.transcriptText}>
+                  {item.refinedTranscript || item.rawTranscript}
+                </Text>
+                <View style={styles.transcriptActions}>
+                  <TouchableOpacity
+                    style={styles.editTranscriptButton}
+                    onPress={() => handleEditTranscript(item)}
+                  >
+                    <Text style={styles.editTranscriptText}>✏️ Edit</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.editTranscriptButton, styles.sendTranscriptButton]}
+                    onPress={() => handleExecuteVoiceCommand(item)}
+                    disabled={executingStates[item.id]}
+                  >
+                    {executingStates[item.id] ? (
+                      <ActivityIndicator size="small" color="#3B82F6" />
+                    ) : (
+                      <Text style={styles.editTranscriptText}>📤 Send</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+          </View>
+        )}
 
         <View style={styles.recordingActions}>
           <View style={styles.playbackControls}>
@@ -180,13 +368,19 @@ const RecordedAudioScreen = ({ navigation }) => {
           </View>
 
           <View style={styles.moreActions}>
-            <TouchableOpacity
-              style={[styles.actionButton, styles.uploadButton]}
-              onPress={() => handleUpload(item)}
-              disabled={loading}
-            >
-              <Text style={styles.buttonEmoji}>☁️</Text>
-            </TouchableOpacity>
+            {item.voiceAssetId && (
+              <TouchableOpacity
+                style={[styles.actionButton, styles.executeButton]}
+                onPress={() => handleExecuteVoiceCommand(item)}
+                disabled={isExecuting || isEditing}
+              >
+                {isExecuting ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.buttonEmoji}>⚡</Text>
+                )}
+              </TouchableOpacity>
+            )}
             
             <TouchableOpacity
               style={[styles.actionButton, styles.deleteButton]}
@@ -377,6 +571,93 @@ const styles = StyleSheet.create({
   },
   deleteButton: {
     backgroundColor: '#6B7280',
+  },
+  executeButton: {
+    backgroundColor: '#8B5CF6',
+  },
+  // Transcript UI Styles
+  transcriptSection: {
+    marginTop: 16,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#E5E7EB',
+  },
+  transcriptDisplay: {
+    backgroundColor: '#F9FAFB',
+    borderRadius: 8,
+    padding: 12,
+  },
+  transcriptLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#374151',
+    marginBottom: 8,
+  },
+  transcriptText: {
+    fontSize: 15,
+    color: '#1F2937',
+    lineHeight: 22,
+    marginBottom: 12,
+  },
+  editTranscriptButton: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: '#EBF5FF',
+    borderRadius: 6,
+  },
+  editTranscriptText: {
+    fontSize: 12,
+    color: '#3B82F6',
+    fontWeight: '500',
+  },
+  transcriptActions: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  sendTranscriptButton: {
+    backgroundColor: '#EBF5FF',
+  },
+  editContainer: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 8,
+    padding: 12,
+    borderWidth: 2,
+    borderColor: '#3B82F6',
+  },
+  transcriptInput: {
+    fontSize: 15,
+    color: '#1F2937',
+    lineHeight: 22,
+    minHeight: 80,
+    textAlignVertical: 'top',
+    marginBottom: 12,
+  },
+  editActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  editButton: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  saveButton: {
+    backgroundColor: '#10B981',
+  },
+  sendButton: {
+    backgroundColor: '#3B82F6',
+  },
+  cancelButton: {
+    backgroundColor: '#EF4444',
+  },
+  editButtonText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '600',
   },
   emptyState: {
     flex: 1,

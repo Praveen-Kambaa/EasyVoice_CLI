@@ -1,9 +1,9 @@
 <resources>
-    <string name="app_name">EVCLI</string>
+    <string name="app_name">Easy Voice</string>
     
     <!-- Accessibility Service Descriptions -->
-    <string name="accessibility_service_description">EVCLI Voice Assistant - Injects transcribed voice text into any app\'s text fields</string>
-    <string name="text_insertion_service_description">EVCLI Text Insertion - Automatically inserts recognized text into text fields</string>
+    <string name="accessibility_service_description">Easy Voice Assistant - Injects transcribed voice text into any app\'s text fields</string>
+    <string name="text_insertion_service_description">Easy Voice Text Insertion - Automatically inserts recognized text into text fields</string>
     
     <!-- Floating Mic Service -->
     <string name="floating_mic_channel_name">Voice Assistant</string>

@@ -1,5 +1,5 @@
 /**
- * EV CLI - Voice Assistant Control
+ * Easy Voice - Voice Assistant Control
  * @format
  */
 
@@ -7,8 +7,7 @@ import React from 'react';
 import { StatusBar, StyleSheet, useColorScheme } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { NavigationContainer } from '@react-navigation/native';
-import { AppNavigator } from './src/navigation/DrawerNavigator';
-
+import AppNavigator from './src/navigation/DrawerNavigator';
 function App() {
   const isDarkMode = useColorScheme() === 'dark';
 

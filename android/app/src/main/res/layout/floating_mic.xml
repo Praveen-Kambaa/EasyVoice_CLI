@@ -14,7 +14,6 @@
         android:src="@drawable/ic_mic_normal"
         android:scaleType="centerInside"
         android:background="?android:attr/selectableItemBackgroundBorderless"
-        android:contentDescription="Start Recording"
         android:visibility="visible" />
 
     <!-- Stop Button (RECORDING/PAUSED states) -->
@@ -25,7 +24,6 @@
         android:src="@drawable/ic_stop"
         android:scaleType="centerInside"
         android:background="?android:attr/selectableItemBackgroundBorderless"
-        android:contentDescription="Stop Recording"
         android:layout_marginEnd="8dp"
         android:visibility="gone" />
 
@@ -37,7 +35,6 @@
         android:src="@drawable/ic_pause"
         android:scaleType="centerInside"
         android:background="?android:attr/selectableItemBackgroundBorderless"
-        android:contentDescription="Pause Recording"
         android:visibility="gone" />
 
     <!-- Resume Button (PAUSED state) -->
@@ -48,7 +45,6 @@
         android:src="@drawable/ic_resume"
         android:scaleType="centerInside"
         android:background="?android:attr/selectableItemBackgroundBorderless"
-        android:contentDescription="Resume Recording"
         android:visibility="gone" />
 
 </LinearLayout>

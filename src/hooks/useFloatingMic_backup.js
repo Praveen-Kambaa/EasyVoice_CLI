@@ -27,7 +27,23 @@ export const useFloatingMic = () => {
       'FloatingMicService_onRecordingStarted',
       () => {
         setRecordingState(prev => ({ ...prev, state: 'RECORDING', error: null }));
-        console.log('🎤 Recording Started');
+        console.log('🎤 Mic Pressed → Recording Started');
+      }
+    );
+
+    const recordingPausedListener = DeviceEventEmitter.addListener(
+      'FloatingMicService_onRecordingPaused',
+      () => {
+        setRecordingState(prev => ({ ...prev, state: 'PAUSED', error: null }));
+        console.log('⏸️ Pause Pressed → Recording Paused');
+      }
+    );
+
+    const recordingResumedListener = DeviceEventEmitter.addListener(
+      'FloatingMicService_onRecordingResumed',
+      () => {
+        setRecordingState(prev => ({ ...prev, state: 'RECORDING', error: null }));
+        console.log('▶️ Resume Pressed → Recording Resumed');
       }
     );
 
@@ -35,22 +51,25 @@ export const useFloatingMic = () => {
       'FloatingMicService_onRecordingStopped',
       () => {
         setRecordingState(prev => ({ ...prev, state: 'STOPPED', error: null }));
-        console.log('🛑 Recording Stopped');
+        console.log('🛑 Stop Pressed → Recording Stopped');
       }
     );
 
-    const recordingFileReadyListener = DeviceEventEmitter.addListener(
-      'FloatingMicService_onPartialResult',
-      (partialText) => {
-        console.log('🔄 Partial result:', partialText);
+    
+    const transcriptionResultListener = DeviceEventEmitter.addListener(
+      'FloatingMicService_onTranscriptionResult',
+      (result) => {
         setRecordingState(prev => ({ 
           ...prev, 
-          lastResult: partialText,
+          state: 'IDLE',
+          lastResult: result,
           error: null 
         }));
+        console.log('📝 Text Pasted:', result);
       }
     );
 
+    
     const errorListener = DeviceEventEmitter.addListener(
       'FloatingMicService_onError',
       (error) => {
@@ -69,39 +88,67 @@ export const useFloatingMic = () => {
       }
     );
 
-    const transcriptionCompleteListener = DeviceEventEmitter.addListener(
-      'FloatingMicService_onTranscriptionComplete',
-      (transcribedText) => {
-        console.log('✅ Transcription completed:', transcribedText);
+    const recordingFileReadyListener = DeviceEventEmitter.addListener(
+      'FloatingMicService_onRecordingFileReady',
+      async (filePath) => {
+        console.log('Recording file ready:', filePath);
         setRecordingState(prev => ({ 
           ...prev, 
           state: 'IDLE',
-          lastResult: transcribedText,
+          lastResult: 'Transcribing...',
           error: null 
         }));
-      }
-    );
-
-    const transcriptionErrorListener = DeviceEventEmitter.addListener(
-      'FloatingMicService_onTranscriptionError',
-      (errorMessage) => {
-        console.error('❌ Transcription error:', errorMessage);
-        setRecordingState(prev => ({ 
-          ...prev, 
-          state: 'IDLE',
-          error: `Transcription failed: ${errorMessage}`
-        }));
+        
+        // Auto-trigger transcription
+        try {
+          const { transcribeAudio } = await import('../api/voiceApi');
+          const response = await transcribeAudio(filePath);
+          
+          if (response.success) {
+            const transcribedText = response.data.transcription || response.data.text;
+            console.log('✅ Transcription successful:', transcribedText);
+            
+            // Send text to accessibility service for injection
+            if (Platform.OS === 'android') {
+              try {
+                await FloatingMicModule.injectText(transcribedText);
+                console.log('✅ Text injected successfully');
+              } catch (error) {
+                console.error('❌ Text injection failed:', error);
+              }
+            }
+            
+            setRecordingState(prev => ({ 
+              ...prev, 
+              lastResult: transcribedText,
+              error: null 
+            }));
+          } else {
+            console.error('❌ Transcription failed:', response.message);
+            setRecordingState(prev => ({ 
+              ...prev, 
+              error: `Transcription failed: ${response.message}`
+            }));
+          }
+        } catch (error) {
+          console.error('❌ Transcription error:', error);
+          setRecordingState(prev => ({ 
+            ...prev, 
+            error: `Transcription error: ${error.message}`
+          }));
+        }
       }
     );
 
     eventListeners.current = [
       recordingStartedListener,
+      recordingPausedListener,
+      recordingResumedListener,
       recordingStoppedListener,
-      recordingFileReadyListener,
+      transcriptionResultListener,
       errorListener,
       overlayCreatedListener,
-      transcriptionCompleteListener,
-      transcriptionErrorListener,
+      recordingFileReadyListener,
     ];
 
     return () => {
