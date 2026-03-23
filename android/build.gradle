@@ -1,29 +1,18 @@
 buildscript {
     ext {
-        buildToolsVersion = "36.0.0"
+        buildToolsVersion = "34.0.0"
         minSdkVersion = 24
-        compileSdkVersion = 36
-        targetSdkVersion = 36
+        compileSdkVersion = 34
+        targetSdkVersion = 34
         ndkVersion = "25.1.8937393"
-        kotlinVersion = "2.1.20"
+        kotlinVersion = "1.8.22"
     }
     repositories {
         google()
         mavenCentral()
     }
     dependencies {
-        classpath("com.android.tools.build:gradle")
-        classpath("com.facebook.react:react-native-gradle-plugin")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+        classpath("com.android.tools.build:gradle:8.0.2")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.8.22")
     }
 }
-
-afterEvaluate {
-    if (project.tasks.findByName('configureCMakeRelWithDebInfo')) {
-        tasks.named('configureCMakeRelWithDebInfo').configure {
-            mustRunAfter ':react-native-sound:copyReleaseJniLibsProjectAndLocalJars'
-        }
-    }
-}
-
-apply plugin: "com.facebook.react.rootproject"

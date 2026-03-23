@@ -1,38 +1,33 @@
 package com.evcli
 
 import android.app.Application
-import com.facebook.react.PackageList
 import com.facebook.react.ReactApplication
-import com.facebook.react.ReactHost
-import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
-import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
-import com.evcli.AndroidPermissionsPackage
-import com.evcli.VoiceAssistantPackage
-import com.evcli.FloatingMicPackage
-import com.evcli.VoiceKeyboardPackage
-import com.evcli.AudioRecorderPackage
+import com.facebook.react.ReactNativeHost
+import com.facebook.react.ReactPackage
+import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint
+import com.facebook.react.defaults.DefaultReactNativeHost
+import com.facebook.soloader.SoLoader
 
 class MainApplication : Application(), ReactApplication {
 
-  override val reactHost: ReactHost by lazy {
-    getDefaultReactHost(
-      context = applicationContext,
-      packageList =
-        PackageList(this).packages.apply {
-          // Packages that cannot be autolinked yet can be added manually here, for example:
-          // add(MyReactNativePackage())
-          // Temporarily disabled to isolate build issues
-          // add(AndroidPermissionsPackage())
-          // add(VoiceAssistantPackage())
-          // add(FloatingMicPackage())
-          // add(VoiceKeyboardPackage())
-          // add(AudioRecorderPackage())
-        },
-    )
-  }
+  override fun getReactNativeHost(): ReactNativeHost =
+      object : DefaultReactNativeHost(this) {
+        override fun getPackages(): List<ReactPackage> =
+            listOf(
+                // Packages will be autolinked by React Native CLI
+            )
+
+        override fun getJSMainModuleName(): String = "index"
+
+        override fun getUseDeveloperSupport(): Boolean = false
+
+        override val isNewArchEnabled: Boolean = false
+        override val isHermesEnabled: Boolean = true
+      }
 
   override fun onCreate() {
     super.onCreate()
-    loadReactNative(this)
+    SoLoader.init(this, false)
+    // New architecture is disabled for stability
   }
 }
